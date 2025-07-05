@@ -185,70 +185,468 @@ class StanfordAlumniCrawler {
         }
     }
 
-    async extractAlumniFromElement(element) {
+    async extractAlumniFromElement(element, page) {
         try {
-            // Extract name (h3 or strong inside the card)
-            const name = await element.$eval('h3, strong', el => el.textContent.trim()).catch(() => 'N/A');
-            // Extract degree/year (first div or span after name)
-            const degree = await element.$eval('div, span', el => el.textContent.trim()).catch(() => 'N/A');
-            // Extract current position (look for "Current position" or similar)
-            const company = await element.$$eval('div, span', els => {
-                const el = els.find(e => e.textContent && e.textContent.toLowerCase().includes('current position'));
-                return el ? el.textContent.trim() : 'N/A';
-            }).catch(() => 'N/A');
+            // Extract name from the card first - try multiple selectors
+            let name = 'N/A';
+            const nameSelectors = [
+                'h3 a',
+                'h3',
+                'strong',
+                'a[data-test="personcard-link"]',
+                '.personcard-name',
+                '[data-test*="name"]'
+            ];
             
-            // Improved: Extract emails with multiple attempts and debugging
-            let emails = [];
-            try {
-                // First, try to expand the email section by clicking the email button
-                const emailButton = await element.$('button[data-test="profile-summary-email"]');
-                if (emailButton) {
-                    console.log(`Clicking email button for ${name}...`);
-                    await emailButton.click();
-                    // Wait a moment for the email section to expand
-                    await new Promise(resolve => setTimeout(resolve, 1000));
-                }
-                
-                // Now try to extract emails from the expanded section
+            for (const selector of nameSelectors) {
                 try {
-                    const emailElements = await element.$$('ul[data-test="profile-summary-email-items"] a[href^="mailto:"]');
-                    if (emailElements.length > 0) {
-                        emails = await Promise.all(emailElements.map(async (el) => {
-                            const href = await el.getAttribute('href');
-                            // Extract email from href="mailto:email@domain.com"
-                            return href ? href.replace('mailto:', '') : '';
-                        }));
-                        emails = emails.filter(email => email); // Remove empty emails
-                        console.log(`Found ${emails.length} emails for ${name}: ${emails.join(', ')}`);
+                    const nameElement = await element.$(selector);
+                    if (nameElement) {
+                        const nameText = await nameElement.textContent();
+                        if (nameText && nameText.trim() && nameText.trim() !== '') {
+                            name = nameText.trim();
+                            console.log(`Found name with selector "${selector}": ${name}`);
+                            break;
+                        }
                     }
                 } catch (e) {
-                    console.warn(`Failed to extract emails for ${name}:`, e.message);
+                    // Try next selector
+                }
+            }
+            
+            if (name === 'N/A' || name === '') {
+                console.log(`❌ Could not extract name from element, trying text content...`);
+                try {
+                    const elementText = await element.textContent();
+                    console.log(`Element text: ${elementText.substring(0, 200)}...`);
+                    // Try to extract name from the first line of text
+                    const lines = elementText.split('\n').filter(line => line.trim());
+                    if (lines.length > 0) {
+                        name = lines[0].trim();
+                        console.log(`Extracted name from text: ${name}`);
+                    }
+                } catch (e) {
+                    console.log(`Failed to get element text: ${e.message}`);
+                }
+            }
+            
+            console.log(`\n🔍 Processing profile for: ${name}`);
+            
+            // Try to find and click the profile link to get full details
+            let profileLink = null;
+            const profileLinkSelectors = [
+                'a[data-test="personcard-link"]',
+                'h3 a',
+                'a[href*="/profile/"]',
+                'a.stretched-link',
+                'a',  // Fallback to any link
+            ];
+            
+            for (const selector of profileLinkSelectors) {
+                try {
+                    const links = await element.$$(selector);
+                    for (const link of links) {
+                        const href = await link.getAttribute('href');
+                        if (href && href.includes('/profile/')) {
+                            profileLink = link;
+                            console.log(`Found profile link with selector: ${selector} (${href})`);
+                            break;
+                        }
+                    }
+                    if (profileLink) break;
+                } catch (e) {
+                    // Try next selector
+                }
+            }
+            
+            if (!profileLink) {
+                console.log(`❌ No profile link found for ${name}, trying alternative approach...`);
+                
+                // Try to find any clickable element that might lead to the profile
+                try {
+                    const allLinks = await element.$$('a');
+                    for (const link of allLinks) {
+                        const href = await link.getAttribute('href');
+                        if (href && (href.includes('/profile/') || href.includes('stanford.edu'))) {
+                            profileLink = link;
+                            console.log(`Found alternative profile link: ${href}`);
+                            break;
+                        }
+                    }
+                } catch (e) {
+                    console.log(`Alternative link search failed: ${e.message}`);
                 }
                 
+                if (!profileLink) {
+                    console.log(`❌ Still no profile link found for ${name}, skipping`);
+                    return null;
+                }
+            }
+            
+            // Get the current page to navigate back to later
+            const currentUrl = page.url();
+            
+            // Click the profile link to go to full profile
+            console.log(`🔗 Clicking profile link for ${name}...`);
+            await profileLink.click();
+            
+            // Wait for the profile page to load
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // Now extract data from the full profile page
+            const degree = await page.$eval('body', () => {
+                // Look for degree information
+                const degreePatterns = [
+                    /MS\s*'?\d{2}/i,
+                    /PhD\s*'?\d{2}/i,
+                    /BA\s*'?\d{2}/i,
+                    /BS\s*'?\d{2}/i,
+                    /MBA\s*'?\d{2}/i
+                ];
+                
+                const bodyText = document.body.textContent;
+                for (const pattern of degreePatterns) {
+                    const match = bodyText.match(pattern);
+                    if (match) return match[0];
+                }
+                return 'N/A';
+            }).catch(() => 'N/A');
+            
+            // Extract company/position
+            const company = await page.$eval('body', () => {
+                const bodyText = document.body.textContent;
+                // Look for current position or company
+                const lines = bodyText.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i].trim();
+                    if (line.toLowerCase().includes('current position') || 
+                        line.toLowerCase().includes('primary') ||
+                        line.toLowerCase().includes('employee')) {
+                        // Return the next few lines that might contain the position
+                        const nextLines = lines.slice(i+1, i+3).join(' ').trim();
+                        if (nextLines && nextLines.length > 0) {
+                            return nextLines;
+                        }
+                    }
+                }
+                return 'N/A';
+            }).catch(() => 'N/A');
+            
+            // Extract emails from the full profile page
+            let emails = [];
+            let urls = [];
+            try {
+                console.log(`📧 Extracting emails and URLs from full profile for ${name}...`);
+                
+                // First try to expand email section if it exists
+                const emailButtonSelectors = [
+                    'button[data-test="profile-summary-email"]',
+                    'button:has-text("Stanford & personal emails")',
+                    'button:has-text("emails")',
+                    '[aria-expanded="false"]:has-text("email")'
+                ];
+                
+                for (const buttonSelector of emailButtonSelectors) {
+                    try {
+                        const emailButton = await page.$(buttonSelector);
+                        if (emailButton) {
+                            console.log(`Found and clicking email button: ${buttonSelector}`);
+                            await emailButton.click();
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            break;
+                        }
+                    } catch (e) {
+                        // Try next selector
+                    }
+                }
+                
+                // Also try to expand URLs section if it exists
+                console.log(`🔗 Looking for URLs section...`);
+                const urlButtonSelectors = [
+                    'button:has-text("URLs")',
+                    'button:has-text("Website")',
+                    'button:has-text("LinkedIn")',
+                    '[aria-expanded="false"]:has-text("URL")',
+                    'button[data-test*="url"]',
+                    'button[data-test*="link"]'
+                ];
+                
+                for (const buttonSelector of urlButtonSelectors) {
+                    try {
+                        const urlButton = await page.$(buttonSelector);
+                        if (urlButton) {
+                            console.log(`Found and clicking URL button: ${buttonSelector}`);
+                            await urlButton.click();
+                            await new Promise(resolve => setTimeout(resolve, 2000));
+                            break;
+                        }
+                    } catch (e) {
+                        // Try next selector
+                    }
+                }
+                
+                // Extract URLs
+                console.log(`🔗 Extracting URLs...`);
+                try {
+                    // Look for website and LinkedIn URLs
+                    const urlSelectors = [
+                        'a[href*="linkedin.com"]',
+                        'a[href*="www."]',
+                        'a[href^="http"]',
+                        'a[href^="https"]'
+                    ];
+                    
+                    for (const selector of urlSelectors) {
+                        const urlElements = await page.$$(selector);
+                        for (const urlEl of urlElements) {
+                            const href = await urlEl.getAttribute('href');
+                            const text = await urlEl.textContent();
+                            
+                            if (href && (href.startsWith('http') || href.startsWith('www.'))) {
+                                // Skip email links and internal Stanford links
+                                if (!href.includes('mailto:') && 
+                                    !href.includes('alumnidirectory.stanford.edu') &&
+                                    !href.includes('stanford.edu/profile') &&
+                                    !href.includes('stanford.edu/search') &&
+                                    !href.includes('stanford.edu/site') &&
+                                    !href.includes('myaccount.stanford.edu') &&
+                                    !href.includes('alumni.stanford.edu') &&
+                                    !href.includes('give.stanford.edu') &&
+                                    !href.includes('gostanford.com') &&
+                                    !href.includes('oval.stanford.edu') &&
+                                    !href.includes('ed.stanford.edu') &&
+                                    !href.includes('engineering.stanford.edu') &&
+                                    !href.includes('humsci.stanford.edu') &&
+                                    !href.includes('law.stanford.edu') &&
+                                    !href.includes('medicine.stanford.edu') &&
+                                    !href.includes('sustainability.stanford.edu') &&
+                                    !href.includes('visit.stanford.edu') &&
+                                    !href.includes('emergency.stanford.edu') &&
+                                    !href.includes('uit.stanford.edu') &&
+                                    !href.includes('adminguide.stanford.edu') &&
+                                    !href.includes('non-discrimination.stanford.edu') &&
+                                    !href.includes('honorrolls.stanford.edu') &&
+                                    !href.includes('studentservices.stanford.edu') &&
+                                    !href.includes('www.stanford.edu') &&
+                                    !href.includes('gsb.stanford.edu')) {
+                                    
+                                    let urlType = 'Website';
+                                    if (href.includes('linkedin.com')) {
+                                        urlType = 'LinkedIn';
+                                    }
+                                    
+                                    const urlEntry = `${urlType}: ${href}`;
+                                    urls.push(urlEntry);
+                                    console.log(`Found ${urlType}: ${href}`);
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Also look for URLs in text content (like the screenshot shows)
+                    const pageText = await page.evaluate(() => document.body.textContent);
+                    const urlMatches = pageText.match(/(?:https?:\/\/|www\.)[^\s\n\r]+/g);
+                    if (urlMatches) {
+                        urlMatches.forEach(url => {
+                            // Clean up the URL and check if it's valid
+                            const cleanUrl = url.replace(/[.,;!?]+$/, ''); // Remove trailing punctuation
+                            if (cleanUrl.includes('.') && 
+                                !cleanUrl.includes('stanford.edu/profile') &&
+                                !cleanUrl.includes('alumnidirectory.stanford.edu') &&
+                                !cleanUrl.includes('stanford.edu/search') &&
+                                !cleanUrl.includes('stanford.edu/site') &&
+                                !cleanUrl.includes('myaccount.stanford.edu') &&
+                                !cleanUrl.includes('alumni.stanford.edu') &&
+                                !cleanUrl.includes('give.stanford.edu') &&
+                                !cleanUrl.includes('gostanford.com') &&
+                                !cleanUrl.includes('oval.stanford.edu') &&
+                                !cleanUrl.includes('ed.stanford.edu') &&
+                                !cleanUrl.includes('engineering.stanford.edu') &&
+                                !cleanUrl.includes('humsci.stanford.edu') &&
+                                !cleanUrl.includes('law.stanford.edu') &&
+                                !cleanUrl.includes('medicine.stanford.edu') &&
+                                !cleanUrl.includes('sustainability.stanford.edu') &&
+                                !cleanUrl.includes('visit.stanford.edu') &&
+                                !cleanUrl.includes('emergency.stanford.edu') &&
+                                !cleanUrl.includes('uit.stanford.edu') &&
+                                !cleanUrl.includes('adminguide.stanford.edu') &&
+                                !cleanUrl.includes('non-discrimination.stanford.edu') &&
+                                !cleanUrl.includes('honorrolls.stanford.edu') &&
+                                !cleanUrl.includes('studentservices.stanford.edu') &&
+                                !cleanUrl.includes('www.stanford.edu') &&
+                                !cleanUrl.includes('gsb.stanford.edu')) {
+                                
+                                let urlType = 'Website';
+                                if (cleanUrl.includes('linkedin.com')) {
+                                    urlType = 'LinkedIn';
+                                }
+                                
+                                const urlEntry = `${urlType}: ${cleanUrl}`;
+                                if (!urls.includes(urlEntry)) {
+                                    urls.push(urlEntry);
+                                    console.log(`Found ${urlType} from text: ${cleanUrl}`);
+                                }
+                            }
+                        });
+                    }
+                    
+                } catch (e) {
+                    console.log(`URL extraction failed: ${e.message}`);
+                }
+                
+                // Extract emails using multiple methods
+                const emailSelectors = [
+                    'a[href^="mailto:"]',
+                    'ul[data-test="profile-summary-email-items"] a',
+                    'ul[data-test="profile-summary-email-items"]'
+                ];
+                
+                for (const selector of emailSelectors) {
+                    try {
+                        if (selector === 'ul[data-test="profile-summary-email-items"]') {
+                            // Extract from ul text content
+                            const ulElement = await page.$(selector);
+                            if (ulElement) {
+                                const ulText = await ulElement.textContent();
+                                console.log(`Found email section text: ${ulText}`);
+                                if (ulText && ulText.includes('@')) {
+                                    const emailMatches = ulText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+                                    if (emailMatches) {
+                                        emailMatches.forEach(email => {
+                                            emails.push(email);
+                                            console.log(`Found email from section: ${email}`);
+                                        });
+                                    }
+                                }
+                            }
+                        } else {
+                            // Extract from links
+                            const emailElements = await page.$$(selector);
+                            for (const emailEl of emailElements) {
+                                const href = await emailEl.getAttribute('href');
+                                if (href && href.includes('mailto:')) {
+                                    const email = href.replace('mailto:', '');
+                                    if (email.includes('@')) {
+                                        emails.push(email);
+                                        console.log(`Found email from link: ${email}`);
+                                    }
+                                }
+                                
+                                const text = await emailEl.textContent();
+                                if (text && text.includes('@')) {
+                                    const emailMatches = text.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+                                    if (emailMatches) {
+                                        emailMatches.forEach(email => {
+                                            emails.push(email);
+                                            console.log(`Found email from text: ${email}`);
+                                        });
+                                    }
+                                }
+                            }
+                        }
+                        
+                        if (emails.length > 0) break;
+                    } catch (e) {
+                        console.log(`Email selector failed: ${e.message}`);
+                    }
+                }
+                
+                // Fallback: search entire page for emails
                 if (emails.length === 0) {
-                    console.log(`No emails found for ${name} after expanding section`);
+                    console.log(`No emails found with selectors, searching page text...`);
+                    const pageText = await page.evaluate(() => document.body.textContent);
+                    const emailMatches = pageText.match(/[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}/g);
+                    if (emailMatches) {
+                        emailMatches.forEach(email => {
+                            if (!email.includes('example.com') && !email.includes('domain.com')) {
+                                emails.push(email);
+                                console.log(`Found email from page search: ${email}`);
+                            }
+                        });
+                    }
+                }
+                
+                // If still no emails, try clicking ALL buttons that might expand email sections
+                if (emails.length === 0) {
+                    console.log(`Still no emails found, trying to click any email-related buttons...`);
+                    try {
+                        // Try to find and click any button that might expand emails
+                        const allButtons = await page.$$('button');
+                        for (const button of allButtons) {
+                            const buttonText = await button.textContent();
+                            if (buttonText && (buttonText.toLowerCase().includes('email') || buttonText.toLowerCase().includes('stanford'))) {
+                                console.log(`Trying to click button with text: ${buttonText.substring(0, 50)}...`);
+                                try {
+                                    await button.click();
+                                    await new Promise(resolve => setTimeout(resolve, 1000));
+                                    
+                                    // Check if emails appeared after clicking
+                                    const quickEmailCheck = await page.$$('a[href^="mailto:"]');
+                                    if (quickEmailCheck.length > 0) {
+                                        console.log(`Found ${quickEmailCheck.length} email links after clicking button!`);
+                                        for (const emailEl of quickEmailCheck) {
+                                            const href = await emailEl.getAttribute('href');
+                                            if (href && href.includes('mailto:')) {
+                                                const email = href.replace('mailto:', '');
+                                                if (email.includes('@')) {
+                                                    emails.push(email);
+                                                    console.log(`Found email after button click: ${email}`);
+                                                }
+                                            }
+                                        }
+                                        break; // Stop clicking buttons if we found emails
+                                    }
+                                } catch (e) {
+                                    // Button click failed, continue
+                                }
+                            }
+                        }
+                    } catch (e) {
+                        console.log(`Button clicking failed: ${e.message}`);
+                    }
+                }
+                
+                // Remove duplicates
+                emails = [...new Set(emails)];
+                urls = [...new Set(urls)];
+                
+                if (emails.length > 0) {
+                    console.log(`✅ Found ${emails.length} emails for ${name}: ${emails.join(', ')}`);
+                } else {
+                    console.log(`❌ No emails found for ${name} on profile page`);
+                }
+                
+                if (urls.length > 0) {
+                    console.log(`✅ Found ${urls.length} URLs for ${name}: ${urls.join(', ')}`);
+                } else {
+                    console.log(`ℹ️ No URLs found for ${name}`);
                 }
                 
             } catch (error) {
-                console.warn(`Email extraction failed for ${name}:`, error.message);
+                console.warn(`Email/URL extraction failed for ${name}:`, error.message);
             }
+            
+            // Navigate back to the directory
+            console.log(`🔙 Navigating back to directory...`);
+            await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 30000 });
+            await new Promise(resolve => setTimeout(resolve, 2000));
             
             const stanfordEmails = emails.filter(e => e.match(/@(alumni\.|gsb\.)?stanford\.edu$/i)).join(', ');
             const personalEmails = emails.filter(e => !e.match(/@(alumni\.|gsb\.)?stanford\.edu$/i)).join(', ');
+            const allUrls = urls.join(', ');
             
-            // Location and classYear may not be present, so set as N/A
-            const location = 'N/A';
-            const classYear = 'N/A';
             return {
                 name,
-                classYear,
+                classYear: 'N/A',
                 degree,
-                location,
+                location: 'N/A',
                 company,
                 stanfordEmail: stanfordEmails || 'N/A',
                 personalEmail: personalEmails || 'N/A',
+                urls: allUrls || 'N/A',
                 extractedAt: new Date().toISOString()
             };
+            
         } catch (error) {
             console.warn('⚠️ Failed to extract data from element:', error.message);
             return null;
@@ -275,6 +673,7 @@ class StanfordAlumniCrawler {
                 { id: 'company', title: 'Company' },
                 { id: 'stanfordEmail', title: 'Stanford Email' },
                 { id: 'personalEmail', title: 'Personal Email' },
+                { id: 'urls', title: 'URLs' },
                 { id: 'extractedAt', title: 'Extracted At' }
             ]
         });
@@ -304,19 +703,19 @@ class StanfordAlumniCrawler {
             console.log('🔍 Navigating to Stanford Alumni Directory...');
             await page.goto('https://alumnidirectory.stanford.edu/', {
                 waitUntil: 'networkidle',
-                timeout: 30000
+                timeout: 60000 // Increased to 60 seconds
             });
             
             console.log('⏳ Waiting for page to fully load...');
             
-            // Wait a bit for the page to settle
-            await new Promise(resolve => setTimeout(resolve, 3000));
+            // Wait longer for the page to settle
+            await new Promise(resolve => setTimeout(resolve, 5000));
             
             // Check if we were redirected to auth page
             const currentUrl = page.url();
             console.log(`🔗 Current URL: ${currentUrl}`);
             
-            if (currentUrl.includes('/auth') || currentUrl.includes('/login') || currentUrl.includes('/signin')) {
+            if (currentUrl.includes('/auth') || currentUrl.includes('/login') || currentUrl.includes('/signin') || currentUrl.includes('pass.stanford.edu')) {
                 console.log('🔐 Detected redirect to authentication page');
                 console.log('❌ Your saved session has expired or is invalid');
                 console.log('\n📝 To fix this:');
@@ -324,6 +723,10 @@ class StanfordAlumniCrawler {
                 console.log('2. Manually log in when the browser opens');
                 console.log('3. Press Enter to save the session');
                 console.log('4. Then run the crawler again');
+                
+                // Keep browser open for 30 seconds so user can see the error
+                console.log('\n⏸️ Browser will stay open for 30 seconds so you can see the error...');
+                await new Promise(resolve => setTimeout(resolve, 30000));
                 
                 throw new Error('Session expired. Please run "npm run save-session" to create a new session.');
             }
@@ -344,7 +747,7 @@ class StanfordAlumniCrawler {
             for (const selector of cardSelectors) {
                 try {
                     console.log(`🔍 Trying selector: ${selector}`);
-                    await page.waitForSelector(selector, { timeout: 5000 });
+                    await page.waitForSelector(selector, { timeout: 10000 });
                     alumniCards = await page.$$(selector);
                     if (alumniCards.length > 0) {
                         foundSelector = selector;
@@ -379,12 +782,16 @@ class StanfordAlumniCrawler {
                     console.log('🔐 Detected forms on page - might need authentication');
                 }
                 
+                // Keep browser open for inspection
+                console.log('\n⏸️ Browser will stay open for 60 seconds for manual inspection...');
+                await new Promise(resolve => setTimeout(resolve, 60000));
+                
                 throw new Error('No alumni cards found on the page. Please check if you need to login manually first.');
             }
             
             let allAlumniData = [];
             let currentPage = 1;
-            const targetProfiles = 100;
+            const targetProfiles = 20; // Reduced from 100 to ensure completion
             
             console.log(`🎯 Target: ${targetProfiles} profiles`);
             console.log(`📋 Starting with ${alumniCards.length} alumni cards on page ${currentPage}`);
@@ -400,12 +807,29 @@ class StanfordAlumniCrawler {
                 console.log(`📋 Found ${alumniCards.length} alumni cards on page ${currentPage} after scrolling`);
                 
                 // Extract data from each card
-                for (let i = 0; i < alumniCards.length && allAlumniData.length < targetProfiles; i++) {
-                    const alumniData = await this.extractAlumniFromElement(alumniCards[i]);
+                let processedCount = 0;
+                while (processedCount < alumniCards.length && allAlumniData.length < targetProfiles) {
+                    // Re-fetch alumni cards after each profile visit to avoid stale elements
+                    const currentAlumniCards = await page.$$(foundSelector);
+                    
+                    if (processedCount >= currentAlumniCards.length) {
+                        console.log(`⚠️ No more cards to process (${processedCount}/${currentAlumniCards.length})`);
+                        break;
+                    }
+                    
+                    console.log(`\n📋 Processing card ${processedCount + 1}/${currentAlumniCards.length} on page ${currentPage}`);
+                    
+                    const alumniData = await this.extractAlumniFromElement(currentAlumniCards[processedCount], page);
                     if (alumniData) {
                         allAlumniData.push(alumniData);
                         console.log(`✅ Extracted ${allAlumniData.length}/${targetProfiles}: ${alumniData.name}`);
+                        
+                        // Save to CSV after every profile for immediate progress tracking
+                        console.log(`💾 Saving progress... (${allAlumniData.length} profiles)`);
+                        await this.saveToCSV(allAlumniData);
                     }
+                    
+                    processedCount++;
                     
                     // Small delay between extractions to avoid overwhelming the server
                     await new Promise(resolve => setTimeout(resolve, 500));
@@ -428,7 +852,7 @@ class StanfordAlumniCrawler {
                 
                 // Wait for new page to load with the same selector we found earlier
                 try {
-                    await page.waitForSelector(foundSelector, { timeout: 15000 });
+                    await page.waitForSelector(foundSelector, { timeout: 30000 });
                 } catch (e) {
                     console.log('⚠️ Timeout waiting for new page content, continuing anyway...');
                 }
@@ -444,7 +868,11 @@ class StanfordAlumniCrawler {
                 console.log('❌ No alumni data collected');
             }
             
-            console.log('\n⏸️ Browser will stay open for inspection. Press Enter to close...');
+            console.log('\n⏸️ Browser will stay open indefinitely for inspection.');
+            console.log('📝 You can manually navigate, inspect the data, or close when ready.');
+            console.log('Press Enter to close the browser...');
+            
+            // Wait indefinitely until user presses Enter
             await new Promise(resolve => {
                 process.stdin.once('data', resolve);
             });
@@ -454,7 +882,14 @@ class StanfordAlumniCrawler {
             console.log('\n🔍 Debug info:');
             console.log(`Current URL: ${page.url()}`);
             console.log(`Page title: ${await page.title().catch(() => 'Unable to get title')}`);
+            
+            // Keep browser open even on error
+            console.log('\n⏸️ Browser will stay open for 60 seconds even after error for debugging...');
+            await new Promise(resolve => setTimeout(resolve, 60000));
+            
         } finally {
+            // Only close if user is ready
+            console.log('🔒 Closing browser...');
             await page.close();
         }
     }
