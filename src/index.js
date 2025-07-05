@@ -38,7 +38,7 @@ program
             if (options.year) searchCriteria.classYear = options.year;
             if (options.degree) searchCriteria.degree = options.degree;
             
-            await crawler.crawl(searchCriteria);
+            await crawler.crawlAlumni();
             
             console.log('\n🎉 Crawling completed successfully!');
             

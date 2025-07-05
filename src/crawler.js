@@ -158,9 +158,9 @@ class StanfordAlumniCrawler {
         console.log('📊 Extracting alumni data...');
         
         try {
-            // Wait for alumni cards to load
+            // Wait for alumni cards to load (no timeout - wait until user closes browser)
             await this.page.waitForSelector('div.flex.flex-col.break-words.text-saa-black.border.border-black-10.shadow-sm', {
-                timeout: this.config.timeout
+                timeout: 0
             });
             
             // Extract data from alumni cards
@@ -196,6 +196,46 @@ class StanfordAlumniCrawler {
                 const el = els.find(e => e.textContent && e.textContent.toLowerCase().includes('current position'));
                 return el ? el.textContent.trim() : 'N/A';
             }).catch(() => 'N/A');
+            
+            // Improved: Extract emails with multiple attempts and debugging
+            let emails = [];
+            try {
+                // First, try to expand the email section by clicking the email button
+                const emailButton = await element.$('button[data-test="profile-summary-email"]');
+                if (emailButton) {
+                    console.log(`Clicking email button for ${name}...`);
+                    await emailButton.click();
+                    // Wait a moment for the email section to expand
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+                
+                // Now try to extract emails from the expanded section
+                try {
+                    const emailElements = await element.$$('ul[data-test="profile-summary-email-items"] a[href^="mailto:"]');
+                    if (emailElements.length > 0) {
+                        emails = await Promise.all(emailElements.map(async (el) => {
+                            const href = await el.getAttribute('href');
+                            // Extract email from href="mailto:email@domain.com"
+                            return href ? href.replace('mailto:', '') : '';
+                        }));
+                        emails = emails.filter(email => email); // Remove empty emails
+                        console.log(`Found ${emails.length} emails for ${name}: ${emails.join(', ')}`);
+                    }
+                } catch (e) {
+                    console.warn(`Failed to extract emails for ${name}:`, e.message);
+                }
+                
+                if (emails.length === 0) {
+                    console.log(`No emails found for ${name} after expanding section`);
+                }
+                
+            } catch (error) {
+                console.warn(`Email extraction failed for ${name}:`, error.message);
+            }
+            
+            const stanfordEmails = emails.filter(e => e.match(/@(alumni\.|gsb\.)?stanford\.edu$/i)).join(', ');
+            const personalEmails = emails.filter(e => !e.match(/@(alumni\.|gsb\.)?stanford\.edu$/i)).join(', ');
+            
             // Location and classYear may not be present, so set as N/A
             const location = 'N/A';
             const classYear = 'N/A';
@@ -205,6 +245,8 @@ class StanfordAlumniCrawler {
                 degree,
                 location,
                 company,
+                stanfordEmail: stanfordEmails || 'N/A',
+                personalEmail: personalEmails || 'N/A',
                 extractedAt: new Date().toISOString()
             };
         } catch (error) {
@@ -213,8 +255,10 @@ class StanfordAlumniCrawler {
         }
     }
 
-    async saveToCSV() {
-        if (this.data.length === 0) {
+    async saveToCSV(data = null) {
+        const dataToSave = data || this.data;
+        
+        if (dataToSave.length === 0) {
             console.log('⚠️ No data to save');
             return;
         }
@@ -229,11 +273,13 @@ class StanfordAlumniCrawler {
                 { id: 'degree', title: 'Degree' },
                 { id: 'location', title: 'Location' },
                 { id: 'company', title: 'Company' },
+                { id: 'stanfordEmail', title: 'Stanford Email' },
+                { id: 'personalEmail', title: 'Personal Email' },
                 { id: 'extractedAt', title: 'Extracted At' }
             ]
         });
         
-        await csvWriter.writeRecords(this.data);
+        await csvWriter.writeRecords(dataToSave);
         console.log(`✅ Data saved to ${path.join(this.config.outputDir, this.config.csvFilename)}`);
     }
 
@@ -244,18 +290,255 @@ class StanfordAlumniCrawler {
         }
     }
 
-    async crawl(searchCriteria = {}) {
-        try {
+    async crawlAlumni() {
+        // Initialize browser and context if not already done
+        if (!this.browser) {
             await this.initialize();
-            await this.login();
-            await this.searchAlumni(searchCriteria);
-            await this.extractAlumniData();
-            await this.saveToCSV();
+        }
+        
+        const page = await this.browser.newContext({
+            storageState: fs.existsSync(this.config.sessionFile) ? this.config.sessionFile : undefined
+        }).then(context => context.newPage());
+        
+        try {
+            console.log('🔍 Navigating to Stanford Alumni Directory...');
+            await page.goto('https://alumnidirectory.stanford.edu/', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+            });
+            
+            console.log('⏳ Waiting for page to fully load...');
+            
+            // Wait a bit for the page to settle
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            // Check if we were redirected to auth page
+            const currentUrl = page.url();
+            console.log(`🔗 Current URL: ${currentUrl}`);
+            
+            if (currentUrl.includes('/auth') || currentUrl.includes('/login') || currentUrl.includes('/signin')) {
+                console.log('🔐 Detected redirect to authentication page');
+                console.log('❌ Your saved session has expired or is invalid');
+                console.log('\n📝 To fix this:');
+                console.log('1. Run: npm run save-session');
+                console.log('2. Manually log in when the browser opens');
+                console.log('3. Press Enter to save the session');
+                console.log('4. Then run the crawler again');
+                
+                throw new Error('Session expired. Please run "npm run save-session" to create a new session.');
+            }
+            
+            // Try multiple selectors to find alumni cards
+            const cardSelectors = [
+                'div.flex.flex-col.break-words.text-saa-black.border.border-black-10.shadow-sm',
+                'div[class*="flex"][class*="flex-col"]',
+                'div[class*="border"][class*="shadow"]',
+                '[data-test*="profile"]',
+                '.profile-card',
+                '.alumni-card'
+            ];
+            
+            let alumniCards = [];
+            let foundSelector = null;
+            
+            for (const selector of cardSelectors) {
+                try {
+                    console.log(`🔍 Trying selector: ${selector}`);
+                    await page.waitForSelector(selector, { timeout: 5000 });
+                    alumniCards = await page.$$(selector);
+                    if (alumniCards.length > 0) {
+                        foundSelector = selector;
+                        console.log(`✅ Found ${alumniCards.length} cards with selector: ${selector}`);
+                        break;
+                    }
+                } catch (e) {
+                    console.log(`❌ Selector "${selector}" not found`);
+                }
+            }
+            
+            if (alumniCards.length === 0) {
+                console.log('🔍 No alumni cards found with standard selectors, checking page content...');
+                
+                // Debug: Check what's actually on the page
+                const pageTitle = await page.title();
+                console.log(`📄 Page title: ${pageTitle}`);
+                
+                // Check if we're on a login page or error page
+                const bodyText = await page.evaluate(() => document.body.innerText).catch(() => 'Unable to get page text');
+                console.log('📄 Page content preview:');
+                console.log(bodyText.substring(0, 500) + '...');
+                
+                // Try to find any clickable elements or forms
+                const forms = await page.$$('form').catch(() => []);
+                const buttons = await page.$$('button').catch(() => []);
+                const links = await page.$$('a').catch(() => []);
+                
+                console.log(`📋 Found ${forms.length} forms, ${buttons.length} buttons, ${links.length} links`);
+                
+                if (forms.length > 0) {
+                    console.log('🔐 Detected forms on page - might need authentication');
+                }
+                
+                throw new Error('No alumni cards found on the page. Please check if you need to login manually first.');
+            }
+            
+            let allAlumniData = [];
+            let currentPage = 1;
+            const targetProfiles = 100;
+            
+            console.log(`🎯 Target: ${targetProfiles} profiles`);
+            console.log(`📋 Starting with ${alumniCards.length} alumni cards on page ${currentPage}`);
+            
+            while (allAlumniData.length < targetProfiles) {
+                console.log(`\n📄 Processing page ${currentPage}...`);
+                
+                // Scroll to load more content on current page
+                await this.scrollToLoadContent(page);
+                
+                // Re-get alumni cards after scrolling (in case more loaded)
+                alumniCards = await page.$$(foundSelector);
+                console.log(`📋 Found ${alumniCards.length} alumni cards on page ${currentPage} after scrolling`);
+                
+                // Extract data from each card
+                for (let i = 0; i < alumniCards.length && allAlumniData.length < targetProfiles; i++) {
+                    const alumniData = await this.extractAlumniFromElement(alumniCards[i]);
+                    if (alumniData) {
+                        allAlumniData.push(alumniData);
+                        console.log(`✅ Extracted ${allAlumniData.length}/${targetProfiles}: ${alumniData.name}`);
+                    }
+                    
+                    // Small delay between extractions to avoid overwhelming the server
+                    await new Promise(resolve => setTimeout(resolve, 500));
+                }
+                
+                // Check if we have enough profiles
+                if (allAlumniData.length >= targetProfiles) {
+                    console.log(`🎉 Reached target of ${targetProfiles} profiles!`);
+                    break;
+                }
+                
+                // Try to navigate to next page
+                const hasNextPage = await this.goToNextPage(page);
+                if (!hasNextPage) {
+                    console.log('📄 No more pages available');
+                    break;
+                }
+                
+                currentPage++;
+                
+                // Wait for new page to load with the same selector we found earlier
+                try {
+                    await page.waitForSelector(foundSelector, { timeout: 15000 });
+                } catch (e) {
+                    console.log('⚠️ Timeout waiting for new page content, continuing anyway...');
+                }
+            }
+            
+            console.log(`\n📊 Final Results: Collected ${allAlumniData.length} profiles`);
+            
+            // Save to CSV
+            if (allAlumniData.length > 0) {
+                await this.saveToCSV(allAlumniData);
+                console.log('✅ Data saved to CSV successfully!');
+            } else {
+                console.log('❌ No alumni data collected');
+            }
+            
+            console.log('\n⏸️ Browser will stay open for inspection. Press Enter to close...');
+            await new Promise(resolve => {
+                process.stdin.once('data', resolve);
+            });
+            
         } catch (error) {
-            console.error('❌ Crawling failed:', error.message);
-            throw error;
+            console.error('❌ Error during crawling:', error.message);
+            console.log('\n🔍 Debug info:');
+            console.log(`Current URL: ${page.url()}`);
+            console.log(`Page title: ${await page.title().catch(() => 'Unable to get title')}`);
         } finally {
-            await this.close();
+            await page.close();
+        }
+    }
+    
+    async scrollToLoadContent(page) {
+        console.log('📜 Scrolling to load more content...');
+        
+        // Scroll to bottom of page to trigger any lazy loading
+        await page.evaluate(() => {
+            window.scrollTo(0, document.body.scrollHeight);
+        });
+        
+        // Wait for content to load
+        await new Promise(resolve => setTimeout(resolve, 2000));
+        
+        // Scroll back to top for easier navigation
+        await page.evaluate(() => {
+            window.scrollTo(0, 0);
+        });
+        
+        await new Promise(resolve => setTimeout(resolve, 1000));
+    }
+    
+    async goToNextPage(page) {
+        try {
+            // Look for pagination buttons - common selectors
+            const nextButtonSelectors = [
+                'button[aria-label="Next page"]',
+                'button[aria-label="next"]',
+                'a[aria-label="Next page"]',
+                'a[aria-label="next"]',
+                'button:has-text("Next")',
+                'a:has-text("Next")',
+                'button[data-testid="next-page"]',
+                'a[data-testid="next-page"]',
+                '.pagination button:last-child',
+                '.pagination a:last-child'
+            ];
+            
+            for (const selector of nextButtonSelectors) {
+                try {
+                    const nextButton = await page.$(selector);
+                    if (nextButton) {
+                        // Check if button is enabled/clickable
+                        const isDisabled = await nextButton.evaluate(el => 
+                            el.disabled || el.classList.contains('disabled') || el.getAttribute('aria-disabled') === 'true'
+                        );
+                        
+                        if (!isDisabled) {
+                            console.log(`🔄 Clicking next page button: ${selector}`);
+                            await nextButton.click();
+                            await new Promise(resolve => setTimeout(resolve, 2000)); // Wait for navigation
+                            return true;
+                        }
+                    }
+                } catch (e) {
+                    // Try next selector
+                }
+            }
+            
+            // If no pagination buttons found, try scrolling to see if there's infinite scroll
+            console.log('🔄 No pagination buttons found, trying infinite scroll...');
+            const initialHeight = await page.evaluate(() => document.body.scrollHeight);
+            
+            // Scroll to bottom
+            await page.evaluate(() => {
+                window.scrollTo(0, document.body.scrollHeight);
+            });
+            
+            // Wait for potential new content
+            await new Promise(resolve => setTimeout(resolve, 3000));
+            
+            const newHeight = await page.evaluate(() => document.body.scrollHeight);
+            
+            if (newHeight > initialHeight) {
+                console.log('📜 New content loaded via infinite scroll');
+                return true;
+            }
+            
+            return false;
+            
+        } catch (error) {
+            console.warn('⚠️ Error navigating to next page:', error.message);
+            return false;
         }
     }
 }
