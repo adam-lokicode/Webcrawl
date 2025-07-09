@@ -294,49 +294,215 @@ class StanfordAlumniCrawler {
             await new Promise(resolve => setTimeout(resolve, 3000));
             
             // Now extract data from the full profile page
-            const degree = await page.$eval('body', () => {
-                // Look for degree information
-                const degreePatterns = [
-                    /MS\s*'?\d{2}/i,
-                    /PhD\s*'?\d{2}/i,
-                    /BA\s*'?\d{2}/i,
-                    /BS\s*'?\d{2}/i,
-                    /MBA\s*'?\d{2}/i
+            const degree = await page.evaluate(() => {
+                const fullText = document.body.textContent;
+                
+                // Method 1: Look for degree displayed prominently near the name (like "LLM '25")
+                const nameSection = fullText.substring(0, 500); // First 500 chars likely contain name and degree
+                const prominentDegreeMatch = nameSection.match(/\b(MBA|MS|PhD|BA|BS|JD|MD|MA|MEd|MFA|MPH|MSW|MPA|LLM|ScD|EdD)\s*['']?\d{2}\b/i);
+                if (prominentDegreeMatch) {
+                    return prominentDegreeMatch[0].trim();
+                }
+                
+                // Method 2: Look for the "Degrees" section specifically
+                const degreesIndex = fullText.indexOf('Degrees');
+                if (degreesIndex !== -1) {
+                    // Get text after "Degrees"
+                    const afterDegrees = fullText.substring(degreesIndex + 'Degrees'.length);
+                    
+                    // Look for the next major section to know where to stop
+                    const nextSectionMatch = afterDegrees.match(/\n\s*(More about me|Skills & specialties|Stanford information|Contact information|Professional experience|Personal information)/i);
+                    const degreesText = nextSectionMatch ? 
+                        afterDegrees.substring(0, nextSectionMatch.index) : 
+                        afterDegrees.substring(0, 800); // Increased limit
+                    
+                    // Clean up the degrees text and extract meaningful degree info
+                    const lines = degreesText.split('\n').map(line => line.trim()).filter(line => line);
+                    
+                    let degreeInfo = [];
+                    let currentYear = '';
+                    
+                    for (const line of lines) {
+                        // Check if it's a year (4 digits)
+                        if (/^\d{4}$/.test(line)) {
+                            currentYear = line;
+                        }
+                        // Check if it's a degree line (contains degree abbreviations or full names)
+                        else if (line.match(/\b(BS|BA|MS|MA|MBA|PhD|JD|MD|MEd|MFA|MPH|MSW|MPA|LLM|ScD|EdD|Bachelor|Master|Doctor)\b/i)) {
+                            // Clean up the degree line
+                            let cleanDegree = line
+                                .replace(/School\s*$/, '') // Remove "School" at the end
+                                .replace(/Humanities.*$/, '') // Remove "Humanities" and everything after
+                                .replace(/Sciences.*$/, '') // Remove "Sciences" and everything after
+                                .trim();
+                            
+                            if (cleanDegree && cleanDegree.length > 2) {
+                                if (currentYear) {
+                                    degreeInfo.push(`${cleanDegree} '${currentYear.slice(-2)}`);
+                                } else {
+                                    degreeInfo.push(cleanDegree);
+                                }
+                            }
+                        }
+                    }
+                    
+                    if (degreeInfo.length > 0) {
+                        return degreeInfo.join(', ');
+                    }
+                }
+                
+                // Method 3: Look for full degree names in text
+                const fullDegreePatterns = [
+                    /(Bachelor|Master|Doctor)\s+of\s+[A-Za-z\s,()&-]+/gi,
+                    /\b(MBA|MS|PhD|BA|BS|JD|MD|MA|MEd|MFA|MPH|MSW|MPA|LLM|ScD|EdD)\s*-?\s*[A-Za-z\s,()&-]+/gi
                 ];
                 
-                const bodyText = document.body.textContent;
-                for (const pattern of degreePatterns) {
-                    const match = bodyText.match(pattern);
-                    if (match) return match[0];
-                }
-                return 'N/A';
-            }).catch(() => 'N/A');
-            
-            // Extract company/position
-            const company = await page.$eval('body', () => {
-                const bodyText = document.body.textContent;
-                // Look for current position or company
-                const lines = bodyText.split('\n');
-                for (let i = 0; i < lines.length; i++) {
-                    const line = lines[i].trim();
-                    if (line.toLowerCase().includes('current position') || 
-                        line.toLowerCase().includes('primary') ||
-                        line.toLowerCase().includes('employee')) {
-                        // Return the next few lines that might contain the position
-                        const nextLines = lines.slice(i+1, i+3).join(' ').trim();
-                        if (nextLines && nextLines.length > 0) {
-                            return nextLines;
+                for (const pattern of fullDegreePatterns) {
+                    const matches = fullText.match(pattern);
+                    if (matches) {
+                        // Return the first reasonable match
+                        for (const match of matches) {
+                            if (match.length < 100 && !match.includes('Stanford') && !match.includes('Alumni') && !match.includes('Directory')) {
+                                return match.trim();
+                            }
                         }
                     }
                 }
+                
+                // Method 4: Simple degree patterns as final fallback
+                const simpleDegreePatterns = [
+                    /\b(MBA|MS|PhD|BA|BS|JD|MD|MA|MEd|MFA|MPH|MSW|MPA|LLM|ScD|EdD)\s*['']?\d{2}\b/gi
+                ];
+                
+                for (const pattern of simpleDegreePatterns) {
+                    const matches = fullText.match(pattern);
+                    if (matches) {
+                        return matches[0].trim();
+                    }
+                }
+                
+                return 'N/A';
+            }).catch(() => 'N/A');
+
+            // Extract location - look for patterns like "City, State" or "City, Country"
+            const location = await page.evaluate(() => {
+                const fullText = document.body.textContent;
+                
+                // Look for location patterns - typically after name/degree
+                const locationPatterns = [
+                    /([A-Za-z\s]+),\s+([A-Za-z\s]+)(?=\s|$)/g,
+                    /([A-Za-z\s]{3,25}),\s+([A-Za-z\s]{2,25})/g
+                ];
+                
+                for (const pattern of locationPatterns) {
+                    const matches = [...fullText.matchAll(pattern)];
+                    for (const match of matches) {
+                        const location = match[0].trim();
+                        // Filter out obvious non-locations
+                        if (location.length > 5 && location.length < 50 &&
+                            !location.includes('Stanford') &&
+                            !location.includes('Alumni') &&
+                            !location.includes('Directory') &&
+                            !location.includes('My Account') &&
+                            !location.includes('Skip to') &&
+                            !location.includes('Industries') &&
+                            !location.includes('Funds') &&
+                            !location.match(/\d{4}/) && // No years
+                            !location.includes('@') && // No emails
+                            !location.includes('CEO') &&
+                            !location.includes('Director') &&
+                            !location.includes('Manager')) {
+                            return location;
+                        }
+                    }
+                }
+                
                 return 'N/A';
             }).catch(() => 'N/A');
             
-            // Extract emails from the full profile page
+            // Extract company/position more precisely
+            const company = await page.evaluate(() => {
+                const fullText = document.body.textContent;
+                
+                // Look for job title patterns that are more specific to the visible content
+                const jobPatterns = [
+                    // Match "CEO, FEXI / EXI Funds" pattern
+                    /(CEO|CTO|CFO|COO|President|Founder|Owner|Director|Manager|VP|Vice President)[,\s]+([^.\n]{5,80})/gi,
+                    // Match "Title, Company" pattern
+                    /([A-Za-z\s]+(?:Director|Manager|Officer|CEO|President|Founder|Owner|Partner|Consultant|Analyst|Engineer))[,\s]+([^.\n]{5,80})/gi,
+                    // Match "Business Development Director, Oracle Corporation" pattern
+                    /([A-Za-z\s]+Director)[,\s]+([A-Za-z\s]+(?:Corporation|Company|Inc|LLC|Group|Fund|Capital|Equity))/gi
+                ];
+                
+                for (const pattern of jobPatterns) {
+                    const matches = [...fullText.matchAll(pattern)];
+                    for (const match of matches) {
+                        const fullMatch = match[0].trim();
+                        
+                        // Filter out navigation and unwanted text
+                        if (fullMatch.length > 10 && fullMatch.length < 150 &&
+                            !fullMatch.includes('Stanford') &&
+                            !fullMatch.includes('Alumni') &&
+                            !fullMatch.includes('Directory') &&
+                            !fullMatch.includes('My Account') &&
+                            !fullMatch.includes('Skip to') &&
+                            !fullMatch.includes('Back to') &&
+                            !fullMatch.includes('external link') &&
+                            !fullMatch.includes('More about') &&
+                            !fullMatch.includes('Skills &')) {
+                            return fullMatch;
+                        }
+                    }
+                }
+                
+                // Look for "Industries:" pattern which often follows job titles
+                const industriesMatch = fullText.match(/Industries:\s*([^.\n]{5,80})/i);
+                if (industriesMatch) {
+                    // Try to find the job title that comes before "Industries:"
+                    const beforeIndustries = fullText.substring(0, fullText.indexOf(industriesMatch[0]));
+                    const jobTitleMatch = beforeIndustries.match(/(CEO|CTO|CFO|COO|President|Founder|Owner|Director|Manager|VP|Vice President)[^.\n]{0,50}$/i);
+                    if (jobTitleMatch) {
+                        const jobTitle = jobTitleMatch[0].trim();
+                        const industries = industriesMatch[1].trim();
+                        return `${jobTitle}, Industries: ${industries}`;
+                    }
+                }
+                
+                // Look for lines that contain job titles
+                const lines = fullText.split('\n');
+                for (let i = 0; i < lines.length; i++) {
+                    const line = lines[i].trim();
+                    
+                    // Skip navigation and common elements
+                    if (line.includes('Skip to main') || 
+                        line.includes('My Account') ||
+                        line.includes('Alumni Directory') ||
+                        line.includes('external link') ||
+                        line.includes('Back to Directory') ||
+                        line.includes('More about me') ||
+                        line.includes('Skills & specialties') ||
+                        line.includes('Stanford') ||
+                        line.length < 8 ||
+                        line.length > 120) {
+                        continue;
+                    }
+                    
+                    // Look for lines that contain clear job titles
+                    if (line.match(/\b(CEO|CTO|CFO|COO|President|Founder|Owner|Director|Manager|VP|Vice President)\b/i) &&
+                        (line.includes(',') || line.includes('/') || line.match(/\b(Fund|Capital|Equity|Corporation|Company|Inc|LLC|Group)\b/i))) {
+                        return line;
+                    }
+                }
+                
+                return 'N/A';
+            }).catch(() => 'N/A');
+            
+            // Extract emails and URLs from the full profile page
             let emails = [];
             let urls = [];
+            let phones = [];
             try {
-                console.log(`📧 Extracting emails and URLs from full profile for ${name}...`);
+                console.log(`📧 Extracting emails, URLs, and phone numbers from full profile for ${name}...`);
                 
                 // First try to expand email section if it exists
                 const emailButtonSelectors = [
@@ -494,11 +660,115 @@ class StanfordAlumniCrawler {
                     console.log(`URL extraction failed: ${e.message}`);
                 }
                 
-                // Extract emails using multiple methods
+                // Extract phone numbers with enhanced methods
+                console.log(`📞 Extracting phone numbers...`);
+                try {
+                    // Method 1: Look for phone numbers in professional contact section
+                    const professionalContactText = await page.evaluate(() => {
+                        // Look for "Professional contact information" section
+                        const fullText = document.body.textContent;
+                        const contactIndex = fullText.indexOf('Professional contact information');
+                        if (contactIndex !== -1) {
+                            return fullText.substring(contactIndex, contactIndex + 300);
+                        }
+                        return '';
+                    });
+                    
+                    if (professionalContactText) {
+                        const phonePatterns = [
+                            /\+1\s*\(\d{3}\)\s*\d{3}-\d{4}/g,  // +1 (650) 924-7485
+                            /\+1\s*\d{3}\s*\d{3}\s*\d{4}/g,    // +1 650 924 7485
+                            /\(\d{3}\)\s*\d{3}-\d{4}/g,        // (650) 924-7485
+                            /\d{3}-\d{3}-\d{4}/g,              // 650-924-7485
+                            /\d{3}\.\d{3}\.\d{4}/g             // 650.924.7485
+                        ];
+                        
+                        for (const pattern of phonePatterns) {
+                            const matches = professionalContactText.match(pattern);
+                            if (matches) {
+                                matches.forEach(phone => {
+                                    const cleanPhone = phone.trim();
+                                    if (!phones.includes(cleanPhone)) {
+                                        phones.push(cleanPhone);
+                                        console.log(`Found phone from professional contact: ${cleanPhone}`);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    
+                    // Method 2: Look for phone numbers in personal information section
+                    const phoneSelectors = [
+                        '[data-test="profile-personal-information"]',
+                        '[data-test="profile-professional-contact"]',
+                        'section:has(h3:contains("contact")) span',
+                        'section:has(h3:contains("phone")) span'
+                    ];
+                    
+                    for (const selector of phoneSelectors) {
+                        try {
+                            const phoneElements = await page.$$(selector);
+                            for (const phoneEl of phoneElements) {
+                                const phoneText = await phoneEl.textContent();
+                                if (phoneText && phoneText.match(/\+?\d{1,3}[\s\-\(\)]*\d{3,4}[\s\-\(\)]*\d{3,4}[\s\-]*\d{3,4}/)) {
+                                    const phoneMatches = phoneText.match(/\+1\s*\(\d{3}\)\s*\d{3}-\d{4}|\+1\s*\d{3}\s*\d{3}\s*\d{4}|\(\d{3}\)\s*\d{3}-\d{4}|\d{3}-\d{3}-\d{4}|\d{3}\.\d{3}\.\d{4}/g);
+                                    if (phoneMatches) {
+                                        phoneMatches.forEach(phone => {
+                                            const cleanPhone = phone.trim();
+                                            if (!phones.includes(cleanPhone)) {
+                                                phones.push(cleanPhone);
+                                                console.log(`Found phone from element: ${cleanPhone}`);
+                                            }
+                                        });
+                                    }
+                                }
+                            }
+                        } catch (e) {
+                            // Try next selector
+                        }
+                    }
+                    
+                    // Method 3: Fallback - search entire page text for phone patterns
+                    if (phones.length === 0) {
+                        const pageText = await page.evaluate(() => document.body.textContent);
+                        
+                        const phonePatterns = [
+                            /\+1\s*\(\d{3}\)\s*\d{3}-\d{4}/g,  // +1 (650) 924-7485
+                            /\+1\s*\d{3}\s*\d{3}\s*\d{4}/g,    // +1 650 924 7485
+                            /\(\d{3}\)\s*\d{3}-\d{4}/g,        // (650) 924-7485
+                            /\d{3}-\d{3}-\d{4}/g,              // 650-924-7485
+                            /\d{3}\.\d{3}\.\d{4}/g             // 650.924.7485
+                        ];
+                        
+                        for (const pattern of phonePatterns) {
+                            const matches = pageText.match(pattern);
+                            if (matches) {
+                                matches.forEach(phone => {
+                                    const cleanPhone = phone.trim();
+                                    // Filter out obviously wrong numbers
+                                    if (!cleanPhone.includes('000-000-0000') && 
+                                        !cleanPhone.includes('123-456-7890') &&
+                                        !phones.includes(cleanPhone)) {
+                                        phones.push(cleanPhone);
+                                        console.log(`Found phone from page text: ${cleanPhone}`);
+                                    }
+                                });
+                            }
+                        }
+                    }
+                    
+                } catch (e) {
+                    console.log(`Phone extraction failed: ${e.message}`);
+                }
+                
+                // Extract emails using multiple robust methods
                 const emailSelectors = [
                     'a[href^="mailto:"]',
                     'ul[data-test="profile-summary-email-items"] a',
-                    'ul[data-test="profile-summary-email-items"]'
+                    'ul[data-test="profile-summary-email-items"]',
+                    '[href*="@stanford.edu"]',
+                    '[href*="@alumni.stanford.edu"]',
+                    'a[href*="mailto"]'
                 ];
                 
                 for (const selector of emailSelectors) {
@@ -530,6 +800,10 @@ class StanfordAlumniCrawler {
                                         emails.push(email);
                                         console.log(`Found email from link: ${email}`);
                                     }
+                                } else if (href && href.includes('@')) {
+                                    // Handle direct email links
+                                    emails.push(href);
+                                    console.log(`Found direct email link: ${href}`);
                                 }
                                 
                                 const text = await emailEl.textContent();
@@ -544,8 +818,6 @@ class StanfordAlumniCrawler {
                                 }
                             }
                         }
-                        
-                        if (emails.length > 0) break;
                     } catch (e) {
                         console.log(`Email selector failed: ${e.message}`);
                     }
@@ -609,6 +881,7 @@ class StanfordAlumniCrawler {
                 // Remove duplicates
                 emails = [...new Set(emails)];
                 urls = [...new Set(urls)];
+                phones = [...new Set(phones)];
                 
                 if (emails.length > 0) {
                     console.log(`✅ Found ${emails.length} emails for ${name}: ${emails.join(', ')}`);
@@ -622,8 +895,189 @@ class StanfordAlumniCrawler {
                     console.log(`ℹ️ No URLs found for ${name}`);
                 }
                 
+                if (phones.length > 0) {
+                    console.log(`✅ Found ${phones.length} phone numbers for ${name}: ${phones.join(', ')}`);
+                } else {
+                    console.log(`ℹ️ No phone numbers found for ${name}`);
+                }
+                
             } catch (error) {
                 console.warn(`Email/URL extraction failed for ${name}:`, error.message);
+            }
+            
+            // Extract career support information
+            let careerSupport = 'No';
+            try {
+                console.log(`🤝 Checking career support availability for ${name}...`);
+                
+                const hasCareerSupport = await page.evaluate(() => {
+                    const fullText = document.body.textContent;
+                    
+                    // Look for career support indicators
+                    const careerSupportIndicators = [
+                        'Willing to offer career support',
+                        'Provide career advice',
+                        'Career mentoring',
+                        'Career guidance',
+                        'Willing to mentor',
+                        'Open to mentoring',
+                        'Career coaching',
+                        'Professional mentoring'
+                    ];
+                    
+                    for (const indicator of careerSupportIndicators) {
+                        if (fullText.includes(indicator)) {
+                            return true;
+                        }
+                    }
+                    
+                    return false;
+                });
+                
+                if (hasCareerSupport) {
+                    careerSupport = 'Yes';
+                    console.log(`✅ ${name} offers career support`);
+                } else {
+                    console.log(`ℹ️ ${name} does not offer career support`);
+                }
+                
+            } catch (error) {
+                console.warn(`Career support check failed for ${name}:`, error.message);
+            }
+
+            // Extract professional contact information availability
+            let professionalContact = 'No';
+            try {
+                console.log(`📞 Checking professional contact availability for ${name}...`);
+                
+                const hasProfessionalContact = await page.evaluate(() => {
+                    const fullText = document.body.textContent;
+                    
+                    // Look for professional contact indicators
+                    const professionalContactIndicators = [
+                        'Professional contact information',
+                        'Professional contact',
+                        'Business contact',
+                        'Work contact',
+                        'Office contact'
+                    ];
+                    
+                    for (const indicator of professionalContactIndicators) {
+                        if (fullText.includes(indicator)) {
+                            return true;
+                        }
+                    }
+                    
+                    // Also check if there's a professional phone number or work email
+                    if (fullText.includes('(Preferred phone)') || 
+                        fullText.includes('Work phone') ||
+                        fullText.includes('Office phone') ||
+                        fullText.includes('Business phone')) {
+                        return true;
+                    }
+                    
+                    return false;
+                });
+                
+                if (hasProfessionalContact) {
+                    professionalContact = 'Yes';
+                    console.log(`✅ ${name} provides professional contact information`);
+                } else {
+                    console.log(`ℹ️ ${name} does not provide professional contact information`);
+                }
+                
+            } catch (error) {
+                console.warn(`Professional contact check failed for ${name}:`, error.message);
+            }
+            
+            // Extract skills before navigating back
+            let skills = [];
+            try {
+                console.log(`🎯 Extracting skills for ${name}...`);
+                
+                // Look for skills in the "Skills & specialties" section
+                const skillsSection = await page.evaluate(() => {
+                    // Look for the Skills & specialties section
+                    const skillsHeadings = document.querySelectorAll('h3, h2, h4');
+                    for (const heading of skillsHeadings) {
+                        const headingText = heading.textContent.trim().toLowerCase();
+                        if (headingText.includes('skills') && headingText.includes('specialties')) {
+                            // Found the skills section, get the content after it
+                            let nextElement = heading.nextElementSibling;
+                            let skillsContent = [];
+                            
+                            // Collect content until we hit another section or run out of siblings
+                            while (nextElement && !nextElement.tagName.match(/^H[1-6]$/)) {
+                                const text = nextElement.textContent.trim();
+                                if (text && text.length > 2 && text.length < 100) {
+                                    // Each line/element is likely a separate skill
+                                    skillsContent.push(text);
+                                }
+                                nextElement = nextElement.nextElementSibling;
+                            }
+                            
+                            return skillsContent.join(', ');
+                        }
+                    }
+                    
+                    // Alternative approach: look for text patterns after "Skills & specialties"
+                    const fullText = document.body.textContent;
+                    const skillsIndex = fullText.indexOf('Skills & specialties');
+                    if (skillsIndex !== -1) {
+                        // Get text after "Skills & specialties"
+                        const afterSkills = fullText.substring(skillsIndex + 'Skills & specialties'.length);
+                        
+                        // Look for the next section to know where to stop
+                        const nextSectionMatch = afterSkills.match(/\n\s*[A-Z][a-z]+\s*(?:\n|$)/);
+                        const skillsText = nextSectionMatch ? 
+                            afterSkills.substring(0, nextSectionMatch.index) : 
+                            afterSkills.substring(0, 300); // Limit to 300 chars
+                        
+                        // Clean up the skills text
+                        const cleanSkills = skillsText
+                            .replace(/\n+/g, ', ')
+                            .replace(/\s+/g, ' ')
+                            .trim();
+                        
+                        if (cleanSkills && cleanSkills.length > 5) {
+                            return cleanSkills;
+                        }
+                    }
+                    
+                    return '';
+                });
+                
+                if (skillsSection && skillsSection.trim()) {
+                    skills.push(skillsSection.trim());
+                    console.log(`Found skills: ${skillsSection.trim()}`);
+                } else {
+                    console.log(`No skills section found for ${name}`);
+                }
+                
+                // If no skills found in structured section, try text patterns
+                if (skills.length === 0) {
+                    const pageText = await page.evaluate(() => document.body.textContent);
+                    
+                    // Look for common skill patterns in the text
+                    const skillPatterns = [
+                        /Skills?\s*[:\-]\s*([^.\n]{10,100})/i,
+                        /Specialties?\s*[:\-]\s*([^.\n]{10,100})/i,
+                        /Expertise?\s*[:\-]\s*([^.\n]{10,100})/i,
+                        /Professional\s+focus\s*[:\-]\s*([^.\n]{10,100})/i
+                    ];
+                    
+                    for (const pattern of skillPatterns) {
+                        const match = pageText.match(pattern);
+                        if (match && match[1]) {
+                            skills.push(match[1].trim());
+                            console.log(`Found skills from pattern: ${match[1].trim()}`);
+                            break;
+                        }
+                    }
+                }
+                
+            } catch (error) {
+                console.warn(`Skills extraction failed for ${name}:`, error.message);
             }
             
             // Navigate back to the directory
@@ -631,19 +1085,25 @@ class StanfordAlumniCrawler {
             await page.goto(currentUrl, { waitUntil: 'networkidle', timeout: 30000 });
             await new Promise(resolve => setTimeout(resolve, 2000));
             
-            const stanfordEmails = emails.filter(e => e.match(/@(alumni\.|gsb\.)?stanford\.edu$/i)).join(', ');
-            const personalEmails = emails.filter(e => !e.match(/@(alumni\.|gsb\.)?stanford\.edu$/i)).join(', ');
+            const stanfordEmails = emails.filter(e => e.match(/@(alumni\.|gsb\.|alumni-gsb\.)?stanford\.edu$/i)).join(', ');
+            const personalEmails = emails.filter(e => !e.match(/@(alumni\.|gsb\.|alumni-gsb\.)?stanford\.edu$/i)).join(', ');
             const allUrls = urls.join(', ');
+            const allPhones = phones.join(', ');
+            const allSkills = skills.join(', ');
             
             return {
                 name,
                 classYear: 'N/A',
                 degree,
-                location: 'N/A',
+                location,
                 company,
                 stanfordEmail: stanfordEmails || 'N/A',
                 personalEmail: personalEmails || 'N/A',
                 urls: allUrls || 'N/A',
+                phone: allPhones || 'N/A',
+                skills: allSkills || 'N/A',
+                careerSupport: careerSupport,
+                professionalContact: professionalContact,
                 extractedAt: new Date().toISOString()
             };
             
@@ -674,12 +1134,88 @@ class StanfordAlumniCrawler {
                 { id: 'stanfordEmail', title: 'Stanford Email' },
                 { id: 'personalEmail', title: 'Personal Email' },
                 { id: 'urls', title: 'URLs' },
+                { id: 'phone', title: 'Phone' },
+                { id: 'skills', title: 'Skills' },
+                { id: 'careerSupport', title: 'Career Support' },
+                { id: 'professionalContact', title: 'Professional Contact' },
                 { id: 'extractedAt', title: 'Extracted At' }
             ]
         });
         
         await csvWriter.writeRecords(dataToSave);
         console.log(`✅ Data saved to ${path.join(this.config.outputDir, this.config.csvFilename)}`);
+    }
+
+    async saveIncrementalCSV(newRecord) {
+        if (!newRecord) {
+            console.log('⚠️ No record to save');
+            return;
+        }
+        
+        const csvFilePath = path.join(this.config.outputDir, this.config.csvFilename);
+        
+        // Check if file exists to determine if we need to write headers
+        const fileExists = fs.existsSync(csvFilePath);
+        
+        const csvWriter = createCsvWriter({
+            path: csvFilePath,
+            header: [
+                { id: 'name', title: 'Name' },
+                { id: 'classYear', title: 'Class Year' },
+                { id: 'degree', title: 'Degree' },
+                { id: 'location', title: 'Location' },
+                { id: 'company', title: 'Company' },
+                { id: 'stanfordEmail', title: 'Stanford Email' },
+                { id: 'personalEmail', title: 'Personal Email' },
+                { id: 'urls', title: 'URLs' },
+                { id: 'phone', title: 'Phone' },
+                { id: 'skills', title: 'Skills' },
+                { id: 'careerSupport', title: 'Career Support' },
+                { id: 'professionalContact', title: 'Professional Contact' },
+                { id: 'extractedAt', title: 'Extracted At' }
+            ],
+            append: fileExists // Append if file exists, otherwise create new
+        });
+        
+        await csvWriter.writeRecords([newRecord]);
+        console.log(`💾 Saved to CSV: ${newRecord.name}`);
+    }
+
+    async getExistingNames() {
+        const csvFilePath = path.join(this.config.outputDir, this.config.csvFilename);
+        
+        if (!fs.existsSync(csvFilePath)) {
+            return new Set();
+        }
+        
+        try {
+            const csvContent = fs.readFileSync(csvFilePath, 'utf8');
+            const lines = csvContent.split('\n');
+            const existingNames = new Set();
+            
+            // Skip header line and process data lines
+            for (let i = 1; i < lines.length; i++) {
+                const line = lines[i].trim();
+                if (line) {
+                    // Extract name from first column (handle CSV escaping)
+                    const firstComma = line.indexOf(',');
+                    if (firstComma > 0) {
+                        let name = line.substring(0, firstComma);
+                        // Remove quotes if present
+                        if (name.startsWith('"') && name.endsWith('"')) {
+                            name = name.slice(1, -1);
+                        }
+                        existingNames.add(name);
+                    }
+                }
+            }
+            
+            console.log(`📋 Found ${existingNames.size} existing names in CSV`);
+            return existingNames;
+        } catch (error) {
+            console.warn('⚠️ Error reading existing CSV:', error.message);
+            return new Set();
+        }
     }
 
     async close() {
@@ -731,141 +1267,68 @@ class StanfordAlumniCrawler {
                 throw new Error('Session expired. Please run "npm run save-session" to create a new session.');
             }
             
-            // Try multiple selectors to find alumni cards
-            const cardSelectors = [
-                'div.flex.flex-col.break-words.text-saa-black.border.border-black-10.shadow-sm',
-                'div[class*="flex"][class*="flex-col"]',
-                'div[class*="border"][class*="shadow"]',
-                '[data-test*="profile"]',
-                '.profile-card',
-                '.alumni-card'
-            ];
-            
-            let alumniCards = [];
-            let foundSelector = null;
-            
-            for (const selector of cardSelectors) {
-                try {
-                    console.log(`🔍 Trying selector: ${selector}`);
-                    await page.waitForSelector(selector, { timeout: 10000 });
-                    alumniCards = await page.$$(selector);
-                    if (alumniCards.length > 0) {
-                        foundSelector = selector;
-                        console.log(`✅ Found ${alumniCards.length} cards with selector: ${selector}`);
-                        break;
-                    }
-                } catch (e) {
-                    console.log(`❌ Selector "${selector}" not found`);
-                }
-            }
-            
-            if (alumniCards.length === 0) {
-                console.log('🔍 No alumni cards found with standard selectors, checking page content...');
-                
-                // Debug: Check what's actually on the page
-                const pageTitle = await page.title();
-                console.log(`📄 Page title: ${pageTitle}`);
-                
-                // Check if we're on a login page or error page
-                const bodyText = await page.evaluate(() => document.body.innerText).catch(() => 'Unable to get page text');
-                console.log('📄 Page content preview:');
-                console.log(bodyText.substring(0, 500) + '...');
-                
-                // Try to find any clickable elements or forms
-                const forms = await page.$$('form').catch(() => []);
-                const buttons = await page.$$('button').catch(() => []);
-                const links = await page.$$('a').catch(() => []);
-                
-                console.log(`📋 Found ${forms.length} forms, ${buttons.length} buttons, ${links.length} links`);
-                
-                if (forms.length > 0) {
-                    console.log('🔐 Detected forms on page - might need authentication');
-                }
-                
-                // Keep browser open for inspection
-                console.log('\n⏸️ Browser will stay open for 60 seconds for manual inspection...');
-                await new Promise(resolve => setTimeout(resolve, 60000));
-                
-                throw new Error('No alumni cards found on the page. Please check if you need to login manually first.');
-            }
-            
             let allAlumniData = [];
-            let currentPage = 1;
-            const targetProfiles = 20; // Reduced from 100 to ensure completion
+            const targetProfiles = 10000; // Set very high to crawl until no more profiles available
             
-            console.log(`🎯 Target: ${targetProfiles} profiles`);
-            console.log(`📋 Starting with ${alumniCards.length} alumni cards on page ${currentPage}`);
+            console.log(`🎯 Target: ${targetProfiles} profiles (will crawl until no more profiles available)`);
+            console.log('🔍 Using multiple search strategies to access the full 320,000+ alumni database...\n');
             
-            while (allAlumniData.length < targetProfiles) {
-                console.log(`\n📄 Processing page ${currentPage}...`);
-                
-                // Scroll to load more content on current page
-                await this.scrollToLoadContent(page);
-                
-                // Re-get alumni cards after scrolling (in case more loaded)
-                alumniCards = await page.$$(foundSelector);
-                console.log(`📋 Found ${alumniCards.length} alumni cards on page ${currentPage} after scrolling`);
-                
-                // Extract data from each card
-                let processedCount = 0;
-                while (processedCount < alumniCards.length && allAlumniData.length < targetProfiles) {
-                    // Re-fetch alumni cards after each profile visit to avoid stale elements
-                    const currentAlumniCards = await page.$$(foundSelector);
+            // Strategy 1: Default search (no filters)
+            console.log('📋 Strategy 1: Crawling default results...');
+            const defaultResults = await this.crawlSearchResults(page, 'default', null);
+            allAlumniData = allAlumniData.concat(defaultResults);
+            console.log(`✅ Default search completed: ${defaultResults.length} profiles`);
+            
+            if (allAlumniData.length >= targetProfiles) {
+                console.log(`🎉 Reached target with default search!`);
+            } else {
+                // Strategy 2: Search by graduation decades
+                const decades = ['1960', '1970', '1980', '1990', '2000', '2010', '2020'];
+                for (const decade of decades) {
+                    if (allAlumniData.length >= targetProfiles) break;
                     
-                    if (processedCount >= currentAlumniCards.length) {
-                        console.log(`⚠️ No more cards to process (${processedCount}/${currentAlumniCards.length})`);
-                        break;
-                    }
-                    
-                    console.log(`\n📋 Processing card ${processedCount + 1}/${currentAlumniCards.length} on page ${currentPage}`);
-                    
-                    const alumniData = await this.extractAlumniFromElement(currentAlumniCards[processedCount], page);
-                    if (alumniData) {
-                        allAlumniData.push(alumniData);
-                        console.log(`✅ Extracted ${allAlumniData.length}/${targetProfiles}: ${alumniData.name}`);
-                        
-                        // Save to CSV after every profile for immediate progress tracking
-                        console.log(`💾 Saving progress... (${allAlumniData.length} profiles)`);
-                        await this.saveToCSV(allAlumniData);
-                    }
-                    
-                    processedCount++;
-                    
-                    // Small delay between extractions to avoid overwhelming the server
-                    await new Promise(resolve => setTimeout(resolve, 500));
+                    console.log(`\n📋 Strategy 2: Searching alumni from ${decade}s...`);
+                    await this.performSearch(page, decade);
+                    const decadeResults = await this.crawlSearchResults(page, `${decade}s`, null);
+                    allAlumniData = allAlumniData.concat(decadeResults);
+                    console.log(`✅ ${decade}s search completed: ${decadeResults.length} profiles`);
                 }
                 
-                // Check if we have enough profiles
-                if (allAlumniData.length >= targetProfiles) {
-                    console.log(`🎉 Reached target of ${targetProfiles} profiles!`);
-                    break;
+                // Strategy 3: Search by schools
+                const schools = ['Business', 'Engineering', 'Medicine', 'Law', 'Education', 'Humanities', 'Sciences'];
+                for (const school of schools) {
+                    if (allAlumniData.length >= targetProfiles) break;
+                    
+                    console.log(`\n📋 Strategy 3: Searching ${school} school alumni...`);
+                    await this.performSearch(page, school);
+                    const schoolResults = await this.crawlSearchResults(page, school, null);
+                    allAlumniData = allAlumniData.concat(schoolResults);
+                    console.log(`✅ ${school} search completed: ${schoolResults.length} profiles`);
                 }
                 
-                // Try to navigate to next page
-                const hasNextPage = await this.goToNextPage(page);
-                if (!hasNextPage) {
-                    console.log('📄 No more pages available');
-                    break;
-                }
-                
-                currentPage++;
-                
-                // Wait for new page to load with the same selector we found earlier
-                try {
-                    await page.waitForSelector(foundSelector, { timeout: 30000 });
-                } catch (e) {
-                    console.log('⚠️ Timeout waiting for new page content, continuing anyway...');
+                // Strategy 4: Search by common names
+                const commonNames = ['Smith', 'Johnson', 'Williams', 'Brown', 'Jones', 'Garcia', 'Miller', 'Davis', 'Rodriguez', 'Martinez'];
+                for (const name of commonNames) {
+                    if (allAlumniData.length >= targetProfiles) break;
+                    
+                    console.log(`\n📋 Strategy 4: Searching surname "${name}"...`);
+                    await this.performSearch(page, name);
+                    const nameResults = await this.crawlSearchResults(page, `surname-${name}`, null);
+                    allAlumniData = allAlumniData.concat(nameResults);
+                    console.log(`✅ Surname "${name}" search completed: ${nameResults.length} profiles`);
                 }
             }
             
-            console.log(`\n📊 Final Results: Collected ${allAlumniData.length} profiles`);
+            // Count total unique profiles collected (duplicates were already filtered during extraction)
+            const totalUniqueProfiles = allAlumniData.length;
             
-            // Save to CSV
-            if (allAlumniData.length > 0) {
-                await this.saveToCSV(allAlumniData);
-                console.log('✅ Data saved to CSV successfully!');
-            } else {
+            console.log(`\n📊 Final Results: Collected ${totalUniqueProfiles} unique profiles across all search strategies`);
+            console.log(`💾 All data has been saved incrementally to: ${path.join(this.config.outputDir, this.config.csvFilename)}`);
+            
+            if (totalUniqueProfiles === 0) {
                 console.log('❌ No alumni data collected');
+            } else {
+                console.log('✅ Crawling completed successfully!');
             }
             
             console.log('\n⏸️ Browser will stay open indefinitely for inspection.');
@@ -892,6 +1355,186 @@ class StanfordAlumniCrawler {
             console.log('🔒 Closing browser...');
             await page.close();
         }
+    }
+    
+    async performSearch(page, searchTerm) {
+        try {
+            console.log(`🔍 Performing search for: "${searchTerm}"`);
+            
+            // Navigate back to main directory page
+            await page.goto('https://alumnidirectory.stanford.edu/', {
+                waitUntil: 'networkidle',
+                timeout: 30000
+            });
+            
+            // Wait for page to settle
+            await new Promise(resolve => setTimeout(resolve, 2000));
+            
+            // Try multiple search box selectors
+            const searchSelectors = [
+                'input[placeholder*="Search"]',
+                'input[type="search"]', 
+                'input[name*="search"]',
+                'input[id*="search"]',
+                'input[class*="search"]',
+                '.search-input',
+                '[data-test*="search"]'
+            ];
+            
+            let searchBox = null;
+            for (const selector of searchSelectors) {
+                try {
+                    await page.waitForSelector(selector, { timeout: 3000 });
+                    searchBox = await page.$(selector);
+                    if (searchBox) {
+                        console.log(`📦 Found search box with selector: ${selector}`);
+                        break;
+                    }
+                } catch (e) {
+                    // Try next selector
+                }
+            }
+            
+            if (searchBox) {
+                await searchBox.clear();
+                await searchBox.type(searchTerm);
+                
+                // Press Enter or click search button
+                await searchBox.press('Enter');
+                
+                // Wait for results to load
+                await new Promise(resolve => setTimeout(resolve, 3000));
+                console.log(`✅ Search completed for: "${searchTerm}"`);
+            } else {
+                console.log(`⚠️ Could not find search box for: "${searchTerm}" - continuing with existing results`);
+            }
+            
+        } catch (error) {
+            console.warn(`⚠️ Search failed for "${searchTerm}":`, error.message, '- continuing with existing results');
+        }
+    }
+    
+    async crawlSearchResults(page, searchType, searchTerm) {
+        const results = [];
+        
+        try {
+            // Get existing names to avoid duplicates
+            const existingNames = await this.getExistingNames();
+            
+            // Try multiple selectors to find alumni cards
+            const cardSelectors = [
+                'div.flex.flex-col.break-words.text-saa-black.border.border-black-10.shadow-sm',
+                'div[class*="flex"][class*="flex-col"]',
+                'div[class*="border"][class*="shadow"]',
+                '[data-test*="profile"]',
+                '.profile-card',
+                '.alumni-card'
+            ];
+            
+            let alumniCards = [];
+            let foundSelector = null;
+            
+            for (const selector of cardSelectors) {
+                try {
+                    await page.waitForSelector(selector, { timeout: 5000 });
+                    alumniCards = await page.$$(selector);
+                    if (alumniCards.length > 0) {
+                        foundSelector = selector;
+                        console.log(`✅ Found ${alumniCards.length} cards with selector: ${selector}`);
+                        break;
+                    }
+                } catch (e) {
+                    // Try next selector
+                }
+            }
+            
+            if (alumniCards.length === 0) {
+                console.log(`⚠️ No alumni cards found for ${searchType} search`);
+                return results;
+            }
+            
+            let currentPage = 1;
+            let totalSavedCount = existingNames.size;
+            
+            while (results.length < 1000) { // Limit per search to 1000 to avoid infinite loops
+                console.log(`📄 Processing ${searchType} page ${currentPage}...`);
+                
+                // Scroll to load more content on current page
+                await this.scrollToLoadContent(page);
+                
+                // Re-get alumni cards after scrolling
+                alumniCards = await page.$$(foundSelector);
+                console.log(`📋 Found ${alumniCards.length} alumni cards on page ${currentPage}`);
+                
+                // Extract data from each card
+                let processedCount = 0;
+                while (processedCount < alumniCards.length && results.length < 1000) {
+                    // Re-fetch alumni cards to avoid stale elements
+                    const currentAlumniCards = await page.$$(foundSelector);
+                    
+                    if (processedCount >= currentAlumniCards.length) {
+                        break;
+                    }
+                    
+                    const alumniData = await this.extractAlumniFromElement(currentAlumniCards[processedCount], page);
+                    if (alumniData) {
+                        // Filter out Stanford website content and other non-alumni entries
+                        const isValidAlumni = !alumniData.name.includes('Stanford') && 
+                                            !alumniData.name.includes('University') && 
+                                            !alumniData.name.includes('Alumni Directory') &&
+                                            !alumniData.name.includes('(link is external)') &&
+                                            alumniData.name.length < 200 && // Reasonable name length
+                                            !alumniData.name.includes('Maps & Directions') &&
+                                            !alumniData.name.includes('Terms of Use');
+                        
+                        if (isValidAlumni) {
+                            // Check if we already have this person
+                            if (!existingNames.has(alumniData.name)) {
+                                results.push(alumniData);
+                                existingNames.add(alumniData.name);
+                                totalSavedCount++;
+                                
+                                // Save incrementally to CSV
+                                await this.saveIncrementalCSV(alumniData);
+                                
+                                console.log(`✅ Extracted ${results.length}: ${alumniData.name} (${searchType} - Page ${currentPage}) [Total saved: ${totalSavedCount}]`);
+                            } else {
+                                console.log(`⏭️ Skipping duplicate: ${alumniData.name}`);
+                            }
+                        } else {
+                            console.log(`🚫 Filtered out non-alumni content: ${alumniData.name.substring(0, 50)}...`);
+                        }
+                    }
+                    
+                    processedCount++;
+                    
+                    // Small delay between extractions
+                    await new Promise(resolve => setTimeout(resolve, 300));
+                }
+                
+                // Try to navigate to next page
+                const hasNextPage = await this.goToNextPage(page);
+                if (!hasNextPage) {
+                    console.log(`📄 No more pages for ${searchType} search`);
+                    break;
+                }
+                
+                currentPage++;
+                
+                // Wait for new page to load
+                try {
+                    await page.waitForSelector(foundSelector, { timeout: 15000 });
+                } catch (e) {
+                    console.log('⚠️ Timeout waiting for new page content');
+                    break;
+                }
+            }
+            
+        } catch (error) {
+            console.warn(`⚠️ Error crawling ${searchType} results:`, error.message);
+        }
+        
+        return results;
     }
     
     async scrollToLoadContent(page) {
@@ -978,4 +1621,4 @@ class StanfordAlumniCrawler {
     }
 }
 
-module.exports = StanfordAlumniCrawler; 
+module.exports = StanfordAlumniCrawler;
